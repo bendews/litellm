@@ -4767,6 +4767,28 @@ def _get_model_info_helper(  # noqa: PLR0915
                 ):
                     _model_info = None
 
+            # Try provider-specific model info if not found in static model cost map
+            if _model_info is None and custom_llm_provider is not None:
+                provider_specific_info = get_provider_info(
+                    model=model, custom_llm_provider=custom_llm_provider
+                )
+                if provider_specific_info is not None:
+                    # ProviderSpecificModelInfo is a TypedDict, use dictionary access
+                    # Set basic model info fields with defaults
+                    _model_info = {
+                        "max_tokens": None,  # Provider-specific info doesn't include this
+                        "max_input_tokens": None,
+                        "max_output_tokens": None,
+                        "input_cost_per_token": 0,  # Default to 0 for provider-specific models
+                        "output_cost_per_token": 0,
+                        "litellm_provider": custom_llm_provider,
+                        "mode": "chat",  # Default to chat mode
+                    }
+                    # Add all the capability flags from provider_specific_info
+                    _model_info.update(provider_specific_info)
+                    # Use just the model name for the key since it's already prefixed
+                    key = model
+
             if _model_info is None or key is None:
                 raise ValueError(
                     "This model isn't mapped yet. Add it here - https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json"

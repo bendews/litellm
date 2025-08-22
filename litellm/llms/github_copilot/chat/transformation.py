@@ -26,6 +26,48 @@ class GithubCopilotConfig(OpenAIConfig, BaseLLMModelInfo):
     ) -> None:
         super().__init__()
         self.authenticator = Authenticator()
+        # Preload model capabilities from GitHub Copilot API
+        self._ensure_model_capabilities_loaded()
+
+    def _get_github_copilot_headers(self, extra_headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        """
+        Get standard GitHub Copilot IDE headers that match VS Code implementation.
+        
+        Args:
+            extra_headers: Optional additional headers to merge
+            
+        Returns:
+            Dictionary of headers required for GitHub Copilot API requests
+        """
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            # Required GitHub Copilot IDE headers (VS Code values)
+            "User-Agent": "GitHubCopilotChat/0.26.7",
+            "Editor-Version": "vscode/1.99.3", 
+            "Editor-Plugin-Version": "copilot-chat/0.26.7",
+            "Copilot-Integration-Id": "vscode-chat",
+        }
+        
+        if extra_headers:
+            headers.update(extra_headers)
+            
+        return headers
+
+    def _ensure_model_capabilities_loaded(self) -> None:
+        """
+        Ensure model capabilities are loaded from GitHub Copilot API.
+        This is called during initialization to populate the capabilities cache.
+        """
+        # Only load if we don't have any cached capabilities
+        if not GithubCopilotConfig._model_capabilities:
+            try:
+                # Silently fetch models to populate capabilities cache
+                self.get_models()
+            except Exception:
+                # If we can't fetch models during init, that's okay
+                # They'll be fetched when needed
+                pass
 
     def _get_openai_compatible_provider_info(
         self,
@@ -73,20 +115,76 @@ class GithubCopilotConfig(OpenAIConfig, BaseLLMModelInfo):
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
     ) -> dict:
-        # Get base headers from parent
-        validated_headers = super().validate_environment(
-            headers, model, messages, optional_params, litellm_params, api_key, api_base
-        )
+        # Get API key from authenticator if not provided
+        if api_key is None:
+            try:
+                api_key = self.authenticator.get_api_key()
+            except GetAPIKeyError as e:
+                raise AuthenticationError(
+                    model=model,
+                    llm_provider="github_copilot",
+                    message=str(e),
+                )
+        
+        # Start with the base OpenAI headers
+        headers["Authorization"] = f"Bearer {api_key}"
+        headers["Content-Type"] = "application/json"
+        
+        # Add required GitHub Copilot IDE headers (same as models endpoint)
+        headers.update({
+            "User-Agent": "GitHubCopilotChat/0.26.7",
+            "Editor-Version": "vscode/1.99.3", 
+            "Editor-Plugin-Version": "copilot-chat/0.26.7",
+            "Copilot-Integration-Id": "vscode-chat",
+        })
 
         # Add X-Initiator header based on message roles
         initiator = self._determine_initiator(messages)
-        validated_headers["X-Initiator"] = initiator
+        headers["X-Initiator"] = initiator
         
         # Add Copilot-Vision-Request header if request contains images and model supports vision
         if self._has_image_content(messages) and self._model_supports_vision(model):
-            validated_headers["Copilot-Vision-Request"] = "true"
+            headers["Copilot-Vision-Request"] = "true"
 
-        return validated_headers
+        return headers
+
+    def transform_request(
+        self,
+        model: str,
+        messages: List[AllMessageValues],
+        optional_params: dict,
+        litellm_params: dict,
+        headers: dict,
+    ) -> dict:
+        """
+        Transform the request for GitHub Copilot API calls.
+        This ensures validate_environment is called to set proper headers.
+        """
+        # Call validate_environment to ensure proper headers are set
+        # This is crucial for GitHub Copilot authentication
+        validated_headers = self.validate_environment(
+            headers=headers,
+            model=model,
+            messages=messages,
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+        )
+        
+        # Call parent transform_request to get the base request
+        transformed_messages = self._transform_messages(messages=messages, model=model)
+        
+        # Include extra_headers in the request data so they get passed to OpenAI client
+        request_data = {
+            "model": model,
+            "messages": transformed_messages,
+            **optional_params,
+        }
+        
+        # Add extra_headers with our GitHub Copilot headers
+        # OpenAI Python client supports extra_headers parameter
+        request_data["extra_headers"] = validated_headers
+        
+        return request_data
 
     def _determine_initiator(self, messages: List[AllMessageValues]) -> str:
         """
@@ -174,55 +272,181 @@ class GithubCopilotConfig(OpenAIConfig, BaseLLMModelInfo):
 
     def get_provider_info(self, model: str) -> Optional[ProviderSpecificModelInfo]:
         """
-        Get provider-specific model information including capabilities from GitHub Copilot.
+        Get provider-specific model information including capabilities from GitHub Copilot API.
         
-        This method maps GitHub Copilot's capability information to LiteLLM's
-        ProviderSpecificModelInfo format.
+        This method uses real capabilities data from the GitHub Copilot API response,
+        with minimal fallback inference for missing data.
         """
-        # Ensure model has the github_copilot/ prefix
-        if not model.startswith("github_copilot/"):
-            model = f"github_copilot/{model}"
+        # Ensure model has the github_copilot/ prefix for lookup
+        lookup_model = model
+        if not lookup_model.startswith("github_copilot/"):
+            lookup_model = f"github_copilot/{model}"
         
-        # Get capabilities from stored model info
-        model_info = GithubCopilotConfig._model_capabilities.get(model)
-        if not model_info:
-            # If no cached info, return default capabilities for GitHub Copilot models
-            return ProviderSpecificModelInfo(
-                supports_function_calling=True,
-                supports_system_messages=True,
-                supports_tool_choice=True,
-                supports_vision=True,  # Most GitHub Copilot models support vision
-                supports_response_schema=True,
-            )
-        
+        # Get capabilities from GitHub Copilot API (cached)
+        model_info = GithubCopilotConfig._model_capabilities.get(lookup_model, {})
         capabilities = model_info.get("capabilities", {})
         
-        # Map GitHub Copilot capabilities to LiteLLM ProviderSpecificModelInfo
+        # Create provider info using real API data
         provider_info = ProviderSpecificModelInfo()
         
-        # Parse capability type (chat, embedding, etc.)
-        capability_type = capabilities.get("type", "").lower()
+        # Function calling support - GitHub Copilot uses "tool_calls"
+        provider_info["supports_function_calling"] = self._get_capability_bool(
+            capabilities, ["tool_calls", "function_calling", "tools"], default=True
+        )
         
-        # GitHub Copilot chat models typically support these features
-        if capability_type == "chat":
-            provider_info["supports_function_calling"] = capabilities.get("function_calling", True)
-            provider_info["supports_system_messages"] = True
-            provider_info["supports_tool_choice"] = True
-            provider_info["supports_vision"] = capabilities.get("vision", True)
-            provider_info["supports_response_schema"] = capabilities.get("response_schema", True)
-            
-        # Parse additional capabilities if available
-        if "limits" in capabilities:
-            # Could add context window information if GitHub Copilot provides it in future
-            pass
+        # System messages - GitHub Copilot generally supports this
+        provider_info["supports_system_messages"] = self._get_capability_bool(
+            capabilities, ["system_messages"], default=True
+        )
         
-        # Parse family information for additional capabilities
-        family = capabilities.get("family", "").lower()
-        if "gpt-4" in family or "gpt-4" in model.lower():
-            provider_info["supports_vision"] = True
-            provider_info["supports_function_calling"] = True
-            
+        # Tool choice support - inferred from tool_calls support
+        provider_info["supports_tool_choice"] = self._get_capability_bool(
+            capabilities, ["parallel_tool_calls", "tool_choice"], default=True
+        )
+        
+        # Vision support - GitHub Copilot uses "vision" field
+        provider_info["supports_vision"] = self._get_capability_bool(
+            capabilities, ["vision", "multimodal"], default=False
+        )
+        
+        # Response schema support - GitHub Copilot uses "structured_outputs"
+        provider_info["supports_response_schema"] = self._get_capability_bool(
+            capabilities, ["structured_outputs", "response_format"], default=True
+        )
+        
+        # Assistant prefill support - typically false for GitHub Copilot
+        provider_info["supports_assistant_prefill"] = self._get_capability_bool(
+            capabilities, ["assistant_prefill"], default=False
+        )
+        
+        # Prompt caching - check if API exposes this
+        provider_info["supports_prompt_caching"] = self._get_capability_bool(
+            capabilities, ["prompt_caching", "cache"], default=False
+        )
+        
+        # Audio capabilities
+        provider_info["supports_audio_input"] = self._get_capability_bool(
+            capabilities, ["audio_input"], default=False
+        )
+        provider_info["supports_audio_output"] = self._get_capability_bool(
+            capabilities, ["audio_output"], default=False
+        )
+        
+        # PDF input support
+        provider_info["supports_pdf_input"] = self._get_capability_bool(
+            capabilities, ["pdf", "document_input"], default=False
+        )
+        
+        # Native streaming - GitHub Copilot uses "streaming" field
+        provider_info["supports_native_streaming"] = self._get_capability_bool(
+            capabilities, ["streaming"], default=True
+        )
+        
+        # Web search capabilities
+        provider_info["supports_web_search"] = self._get_capability_bool(
+            capabilities, ["web_search", "search"], default=False
+        )
+        
+        # Reasoning capabilities (O-series models)
+        # GitHub Copilot API doesn't expose reasoning explicitly, use family/model inference
+        provider_info["supports_reasoning"] = self._detect_reasoning_support(
+            model=lookup_model, capabilities=capabilities
+        )
+        
+        # Computer use - not supported by GitHub Copilot
+        provider_info["supports_computer_use"] = self._get_capability_bool(
+            capabilities, ["computer_use"], default=False
+        )
+        
         return provider_info
+
+    def _get_capability_bool(self, capabilities: dict, capability_keys: List[str], default: bool = False) -> bool:
+        """
+        Get a boolean capability from the GitHub Copilot API response.
+        
+        Args:
+            capabilities: The capabilities dict from GitHub Copilot API
+            capability_keys: List of possible keys to check for this capability
+            default: Default value if no capability data is found
+            
+        Returns:
+            Boolean indicating if the capability is supported
+        """
+        # Check direct capabilities dict
+        for key in capability_keys:
+            if key in capabilities:
+                value = capabilities[key]
+                if isinstance(value, bool):
+                    return value
+                elif isinstance(value, str):
+                    return value.lower() in ("true", "yes", "1", "enabled")
+                elif value is not None:
+                    return bool(value)
+        
+        # Check nested 'supports' dict
+        supports = capabilities.get("supports", {})
+        if supports:
+            for key in capability_keys:
+                if key in supports:
+                    value = supports[key]
+                    if isinstance(value, bool):
+                        return value
+                    elif isinstance(value, str):
+                        return value.lower() in ("true", "yes", "1", "enabled")
+                    elif value is not None:
+                        return bool(value)
+        
+        # No capability data found, use default
+        return default
+
+    def _detect_reasoning_support(self, model: str, capabilities: dict) -> bool:
+        """
+        Detect reasoning support using multiple strategies.
+        
+        Args:
+            model: The model name to check
+            capabilities: The capabilities dict from GitHub Copilot API
+            
+        Returns:
+            Boolean indicating if the model supports reasoning
+        """
+        # Strategy 1: Check family field from capabilities
+        family = capabilities.get("family", "").lower()
+        
+        # Known reasoning model families
+        reasoning_families = [
+            "o1", "o1-mini", "o1-preview", 
+            "o2", "o2-mini", 
+            "o3", "o3-mini", "o3-pro",
+            "o4", "o4-mini",
+            # Future O-series models
+        ]
+        
+        if family in reasoning_families:
+            return True
+            
+        # Strategy 2: Check if family starts with known reasoning prefixes
+        reasoning_prefixes = ["o1", "o2", "o3", "o4", "o5"]
+        for prefix in reasoning_prefixes:
+            if family.startswith(prefix):
+                return True
+        
+        # Strategy 3: Model name pattern matching (fallback)
+        model_lower = model.lower()
+        reasoning_patterns = [
+            "o1", "o1-", "o1_", 
+            "o2", "o2-", "o2_",
+            "o3", "o3-", "o3_",
+            "o4", "o4-", "o4_",
+            "reasoning", "think", "deep", "research"
+        ]
+        
+        for pattern in reasoning_patterns:
+            if pattern in model_lower:
+                return True
+                
+        return False
+
 
     def get_models(
         self, api_key: Optional[str] = None, api_base: Optional[str] = None, 
@@ -259,21 +483,9 @@ class GithubCopilotConfig(OpenAIConfig, BaseLLMModelInfo):
         
         # Make request to the models endpoint (GitHub Copilot uses /models, not /v1/models)
         try:
-            # GitHub Copilot requires specific editor headers for IDE authentication
-            headers = {
-                "Authorization": f"Bearer {dynamic_api_key}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                # Required GitHub Copilot IDE headers (default to VS Code values)
-                "User-Agent": "GitHubCopilotChat/0.26.7",
-                "Editor-Version": "vscode/1.99.3", 
-                "Editor-Plugin-Version": "copilot-chat/0.26.7",
-                "Copilot-Integration-Id": "vscode-chat",
-            }
-            
-            # Allow overriding headers (useful for different editors or testing)
-            if extra_headers:
-                headers.update(extra_headers)
+            # Get standard GitHub Copilot headers
+            headers = self._get_github_copilot_headers(extra_headers)
+            headers["Authorization"] = f"Bearer {dynamic_api_key}"
             
             response = litellm.module_level_client.get(
                 url=f"{dynamic_api_base.rstrip('/')}/models",
@@ -312,7 +524,7 @@ class GithubCopilotConfig(OpenAIConfig, BaseLLMModelInfo):
                         litellm_model_name = f"github_copilot/{model_id}"
                         litellm_model_names.append(litellm_model_name)
                         
-                        # Store model capabilities for later use in get_provider_info
+                        # Store comprehensive model info for later use in get_provider_info
                         capabilities = model.get("capabilities", {})
                         model_info = {
                             "id": model_id,
@@ -320,6 +532,13 @@ class GithubCopilotConfig(OpenAIConfig, BaseLLMModelInfo):
                             "capabilities": capabilities,
                             "preview": model.get("preview", False),
                             "is_fallback": model.get("is_fallback", False),
+                            "description": model.get("description", ""),
+                            "version": model.get("version", ""),
+                            "family": model.get("family", ""),
+                            "limits": model.get("limits", {}),
+                            "tags": model.get("tags", []),
+                            "publisher": model.get("publisher", ""),
+                            "created": model.get("created", ""),
                         }
                         
                         # Store in class-level cache
