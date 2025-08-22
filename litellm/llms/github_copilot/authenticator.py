@@ -206,17 +206,11 @@ class Authenticator:
         """
         headers = {
             "accept": "application/json",
-            "editor-version": "vscode/1.85.1",
-            "editor-plugin-version": "copilot/1.155.0",
-            "user-agent": "GithubCopilot/1.155.0",
-            "accept-encoding": "gzip,deflate,br",
+            "content-type": "application/json",
         }
 
         if access_token:
-            headers["authorization"] = f"token {access_token}"
-
-        if "content-type" not in headers:
-            headers["content-type"] = "application/json"
+            headers["Authorization"] = f"token {access_token}"
 
         return headers
 
@@ -357,7 +351,6 @@ class Authenticator:
 
         print(  # noqa: T201
             f"Please visit {verification_uri} and enter code {user_code} to authenticate.",
-
             # When this is running in docker, it may not be flushed immediately
             # so we force flush to ensure the user sees the message
             flush=True,

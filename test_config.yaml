@@ -1,0 +1,19 @@
+model_list:
+  - model_name: github_copilot/*
+    litellm_params:
+      model: github_copilot/*
+      headers: 
+        Accept: application/json
+        Content-Type: application/json
+        User-Agent: GitHubCopilotChat/0.26.7
+        Editor-Version: vscode/1.99.3
+        Editor-Plugin-Version: copilot-chat/0.26.7
+        Copilot-Integration-Id: vscode-chat
+      #   Openai-Intent: conversation-edits
+      #   X-Initiator: user
+  - model_name: lmstudio/*
+    litellm_params:
+      model: openai/*
+      api_base: "http://10.1.1.233:1234/v1"
+litellm_settings:
+  check_provider_endpoint: true

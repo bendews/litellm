@@ -475,6 +475,7 @@ mistral_chat_models: List = []
 text_completion_codestral_models: List = []
 anthropic_models: List = []
 openrouter_models: List = []
+github_copilot_models: List = []
 datarobot_models: List = []
 vertex_language_models: List = []
 vertex_vision_models: List = []
@@ -597,6 +598,8 @@ def add_known_models():
             empower_models.append(key)
         elif value.get("litellm_provider") == "openrouter":
             openrouter_models.append(key)
+        elif value.get("litellm_provider") == "github_copilot":
+            github_copilot_models.append(key)
         elif value.get("litellm_provider") == "datarobot":
             datarobot_models.append(key)
         elif value.get("litellm_provider") == "vertex_ai-text-models":
@@ -849,6 +852,7 @@ models_by_provider: dict = {
     "together_ai": together_ai_models,
     "baseten": baseten_models,
     "openrouter": openrouter_models,
+    "github_copilot": github_copilot_models,
     "datarobot": datarobot_models,
     "vertex_ai": vertex_chat_models
     + vertex_text_models

@@ -58,6 +58,8 @@ def get_supported_openai_params(  # noqa: PLR0915
         return litellm.OllamaChatConfig().get_supported_openai_params(model=model)
     elif custom_llm_provider == "anthropic":
         return litellm.AnthropicConfig().get_supported_openai_params(model=model)
+    elif custom_llm_provider == "github_copilot":
+        return litellm.GithubCopilotConfig().get_supported_openai_params(model=model)
     elif custom_llm_provider == "anthropic_text":
         return litellm.AnthropicTextConfig().get_supported_openai_params(model=model)
     elif custom_llm_provider == "fireworks_ai":
